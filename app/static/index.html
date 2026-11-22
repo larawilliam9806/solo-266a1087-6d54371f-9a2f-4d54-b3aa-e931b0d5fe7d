@@ -49,6 +49,7 @@
 <header><h1>🚌 公交 GTFS 时刻表发布系统</h1></header>
 <nav>
   <button data-tab="query" class="active">时刻查询</button>
+  <button data-tab="od">客流核算</button>
   <button data-tab="publish">发布新版本</button>
   <button data-tab="versions">版本记录</button>
 </nav>
@@ -71,6 +72,70 @@
     <button class="primary" id="q-btn">查询</button>
     <span class="muted" id="q-meta"></span>
     <div id="q-result"></div>
+  </div>
+</section>
+
+<!-- ============ 客流核算 ============ -->
+<section id="tab-od" class="panel">
+  <div class="card">
+    <h2>起讫站客流核算</h2>
+    <p class="muted">选择当前正式版运行图、运营日和当天开行的一趟班次；
+      先上传「逐停站上下车总数」CSV，可另交「已核实起讫站对及人次」CSV（核实值允许为 0）。
+      两份表可分别换交：只有存在同时满足各停站上下车总数和每条已核实人次的全趟分配，
+      换交才生效；表格有误、无解或保存失败时，原表和原结果继续可查。</p>
+    <div class="grid">
+      <div>
+        <label>运营日</label>
+        <input type="date" id="o-date">
+      </div>
+      <div>
+        <label>班次（当前正式版当天开行的班次）</label>
+        <select id="o-trip"></select>
+      </div>
+    </div>
+    <button class="primary" id="o-load">加载班次</button>
+    <span class="muted" id="o-meta"></span>
+    <div id="o-stops"></div>
+  </div>
+
+  <div class="card" id="o-tables-card" style="display:none">
+    <h2>当前生效底表</h2>
+    <div id="o-tables"></div>
+    <h2 style="margin-top:18px">换交底表</h2>
+    <div class="grid">
+      <div>
+        <label>逐停站上下车总数 CSV
+          <code>stop_sequence,boardings,alightings</code></label>
+        <input type="file" id="o-file-totals" accept=".csv">
+        <button class="primary" id="o-up-totals">换交上下车总数表</button>
+      </div>
+      <div>
+        <label>已核实起讫站对 CSV
+          <code>board_stop_sequence,alight_stop_sequence,passengers</code></label>
+        <input type="file" id="o-file-verified" accept=".csv">
+        <button class="primary" id="o-up-verified">换交已核实站对表</button>
+      </div>
+    </div>
+    <div id="o-up-result"></div>
+    <div id="o-records"></div>
+  </div>
+
+  <div class="card" id="o-range-card" style="display:none">
+    <h2>站对人次区间</h2>
+    <p class="muted">任选两个先后停站，按同一时点生效的底表组合，
+      算出该站对在所有可行分配中的最少和最多人次。</p>
+    <div class="grid">
+      <div>
+        <label>上车站</label>
+        <select id="o-board"></select>
+      </div>
+      <div>
+        <label>下车站</label>
+        <select id="o-alight"></select>
+      </div>
+    </div>
+    <button class="primary" id="o-range-btn">核算最少 / 最多人次</button>
+    <div id="o-range-result"></div>
   </div>
 </section>
 
@@ -221,6 +286,146 @@ async function showErrors(vid) {
     ${data.errors.map(e => `<tr><td>${e.file}</td><td>${e.row ?? "-"}</td>
       <td>${e.field ?? "-"}</td><td>${e.message}</td></tr>`).join("")}</table>`;
 }
+
+// ---------- 客流核算 ----------
+$("o-date").value = new Date().toISOString().slice(0, 10);
+
+function odErrorsTable(errors) {
+  return `<table><tr><th>文件</th><th>行号</th><th>字段</th><th>错误</th></tr>
+    ${errors.map(e => `<tr><td>${e.file}</td><td>${e.row ?? "-"}</td>
+      <td>${e.field ?? "-"}</td><td>${e.message}</td></tr>`).join("")}</table>`;
+}
+
+$("o-load").onclick = async () => {
+  const date = $("o-date").value;
+  const sel = $("o-trip");
+  $("o-meta").textContent = "";
+  if (!date) { $("o-meta").textContent = "请选择运营日"; return; }
+  const res = await fetch(`/api/od/trips?date=${date}`);
+  const data = await res.json();
+  if (!res.ok) { $("o-meta").textContent = data.detail || "加载失败"; return; }
+  if (!data.trips.length) {
+    sel.innerHTML = "";
+    $("o-meta").textContent = "该运营日没有开行的班次";
+    return;
+  }
+  sel.innerHTML = data.trips.map(t =>
+    `<option value="${t.trip_id}">${t.route_short_name || t.route_id} · ${t.trip_id}` +
+    `${t.headsign ? " · " + t.headsign : ""} · ${t.first_departure} 发车 · ${t.stop_count} 站</option>`).join("");
+  $("o-meta").textContent = `正式版 v${data.version_id} · ${data.trips.length} 个班次`;
+  loadOdState();
+};
+
+$("o-trip").onchange = () => loadOdState();
+
+async function loadOdState() {
+  const trip = $("o-trip").value, date = $("o-date").value;
+  if (!trip || !date) return;
+  const res = await fetch(`/api/od/state?trip_id=${encodeURIComponent(trip)}&date=${date}`);
+  const data = await res.json();
+  if (!res.ok) {
+    $("o-stops").innerHTML = `<div class="banner err">${data.detail || "加载失败"}</div>`;
+    $("o-tables-card").style.display = "none";
+    $("o-range-card").style.display = "none";
+    return;
+  }
+  $("o-stops").innerHTML = `<p class="muted">班次 ${data.trip_id}` +
+    `${data.headsign ? " · " + data.headsign : ""} · 线路 ${data.route.route_short_name || data.route.route_id}` +
+    ` · 正式版 v${data.version_id} · ${data.service_date}</p>
+    <table><tr><th>停站序号</th><th>站点</th><th>到站</th><th>发车</th></tr>
+    ${data.stops.map(s => `<tr><td>${s.stop_sequence}</td>
+      <td>${s.stop_name} <span class="muted">${s.stop_id}</span></td>
+      <td>${s.arrival}</td><td>${s.departure}</td></tr>`).join("")}</table>`;
+
+  // 生效底表
+  const t = data.stop_totals, v = data.verified_od;
+  $("o-tables").innerHTML =
+    `<h3 style="font-size:14px;margin:6px 0">逐停站上下车总数 ` +
+    (t ? `<span class="muted">底表 #${t.table_id} · ${t.uploaded_at}</span>` : "") + `</h3>` +
+    (t ? `<table><tr><th>停站序号</th><th>上车总数</th><th>下车总数</th></tr>
+      ${t.rows.map(r => `<tr><td>${r.stop_sequence}</td><td>${r.boardings}</td>
+        <td>${r.alightings}</td></tr>`).join("")}</table>`
+       : `<p class="muted">尚未生效 —— 请先上传上下车总数表</p>`) +
+    `<h3 style="font-size:14px;margin:14px 0 6px">已核实起讫站对 ` +
+    (v ? `<span class="muted">底表 #${v.table_id} · ${v.uploaded_at}</span>` : "") + `</h3>` +
+    (v ? (v.rows.length
+           ? `<table><tr><th>上车站序</th><th>下车站序</th><th>核实人次</th></tr>
+              ${v.rows.map(r => `<tr><td>${r.board_stop_sequence}</td>
+                <td>${r.alight_stop_sequence}</td><td>${r.passengers}</td></tr>`).join("")}</table>`
+           : `<p class="muted">底表为空：没有任何已核实约束</p>`)
+       : `<p class="muted">尚未生效 —— 无已核实约束</p>`);
+
+  // 最近提交记录
+  if (data.recent_uploads.length) {
+    $("o-records").innerHTML = `<h3 style="font-size:14px;margin:16px 0 6px">最近提交记录</h3>
+      <table><tr><th>ID</th><th>表</th><th>结果</th><th>时间</th></tr>
+      ${data.recent_uploads.map(r => `<tr>
+        <td>#${r.id}</td>
+        <td>${r.kind === "stop_totals" ? "上下车总数" : "已核实站对"}</td>
+        <td>${r.status === "active" ? '<span class="ok">已生效</span>'
+              : `<span class="bad">已拒绝（${r.error_count} 个错误）</span>`}</td>
+        <td>${r.created_at}</td></tr>
+        ${r.errors.length ? `<tr><td></td><td colspan="3">${odErrorsTable(r.errors)}</td></tr>` : ""}`).join("")}
+      </table>`;
+  } else {
+    $("o-records").innerHTML = "";
+  }
+
+  // 站对下拉
+  const opts = data.stops.map(s =>
+    `<option value="${s.stop_sequence}">${s.stop_sequence} · ${s.stop_name}</option>`).join("");
+  $("o-board").innerHTML = opts;
+  $("o-alight").innerHTML = opts;
+  if (data.stops.length > 1) $("o-alight").selectedIndex = 1;
+  $("o-tables-card").style.display = "";
+  $("o-range-card").style.display = "";
+  $("o-up-result").innerHTML = "";
+  $("o-range-result").innerHTML = "";
+}
+
+async function uploadOd(kind, fileInputId) {
+  const f = $(fileInputId).files[0];
+  const box = $("o-up-result");
+  if (!f) { box.innerHTML = '<div class="banner err">请选择 CSV 文件</div>'; return; }
+  const fd = new FormData();
+  fd.append("trip_id", $("o-trip").value);
+  fd.append("date", $("o-date").value);
+  fd.append("file", f);
+  const res = await fetch(`/api/od/${kind}`, { method: "POST", body: fd });
+  const data = await res.json();
+  if (res.ok) {
+    box.innerHTML = `<div class="banner ok">✔ ${data.message}（底表 #${data.table_id}）</div>`;
+  } else {
+    const d = data.detail;
+    box.innerHTML = `<div class="banner err">✘ ${(d && d.message) || JSON.stringify(data)}</div>` +
+      (d && d.errors ? odErrorsTable(d.errors) : "");
+  }
+  loadOdState();  // 无论成败都刷新：生效组合与提交记录以服务端为准
+}
+
+$("o-up-totals").onclick = () => uploadOd("stop-totals", "o-file-totals");
+$("o-up-verified").onclick = () => uploadOd("verified", "o-file-verified");
+
+$("o-range-btn").onclick = async () => {
+  const b = $("o-board").value, a = $("o-alight").value;
+  const box = $("o-range-result");
+  if (!b || !a) { box.innerHTML = '<div class="banner err">请先加载班次</div>'; return; }
+  if (Number(b) >= Number(a)) {
+    box.innerHTML = '<div class="banner err">上车站序须早于下车站序</div>';
+    return;
+  }
+  const res = await fetch(`/api/od/range?trip_id=${encodeURIComponent($("o-trip").value)}` +
+    `&date=${$("o-date").value}&board_seq=${b}&alight_seq=${a}`);
+  const data = await res.json();
+  if (!res.ok) {
+    box.innerHTML = `<div class="banner err">${data.detail || "核算失败"}</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="banner ok">站对 ${data.board_stop_sequence} → ${data.alight_stop_sequence}：
+    最少 <b>${data.min_passengers}</b> 人次，最多 <b>${data.max_passengers}</b> 人次
+    <span class="muted">（依据底表：上下车总数 #${data.stop_totals_table_id}` +
+    `${data.verified_od_table_id ? " + 已核实 #" + data.verified_od_table_id : ""}）</span></div>`;
+};
 
 loadRoutes();
 </script>

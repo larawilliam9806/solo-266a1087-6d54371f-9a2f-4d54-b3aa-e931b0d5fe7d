@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 
@@ -96,6 +97,34 @@ CREATE TABLE IF NOT EXISTS version_errors (
     message    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_version_errors ON version_errors (version_id);
+
+-- 起讫站客流核算：每次提交的底表（生效或被拒）都留痕，永不修改
+CREATE TABLE IF NOT EXISTS od_tables (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id   INTEGER NOT NULL,           -- 所属运行图（正式版）
+    service_date TEXT NOT NULL,              -- 运营日 YYYY-MM-DD
+    trip_id      TEXT NOT NULL,
+    kind         TEXT NOT NULL CHECK (kind IN ('stop_totals', 'verified_od')),
+    status       TEXT NOT NULL CHECK (status IN ('active', 'rejected')),
+    csv_content  TEXT,                       -- active 表的原始 CSV
+    error_count  INTEGER NOT NULL DEFAULT 0,
+    errors_json  TEXT,                       -- rejected 表的错误明细
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_od_tables_scope
+    ON od_tables (version_id, service_date, trip_id, kind, id);
+
+-- 每个 (运行图, 运营日, 班次) 当前生效的两份底表指针；
+-- 换交 = 单事务内插新表 + 拨指针，查询方永远看到同一时点生效的组合
+CREATE TABLE IF NOT EXISTS od_effective (
+    version_id   INTEGER NOT NULL,
+    service_date TEXT NOT NULL,
+    trip_id      TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    table_id     INTEGER NOT NULL,
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (version_id, service_date, trip_id, kind)
+);
 """
 
 
@@ -178,3 +207,84 @@ def record_failed_version(conn: sqlite3.Connection, label: str,
             "VALUES (?, ?, ?, ?, ?)",
             [(vid, e["file"], e["row"], e["field"], e["message"]) for e in errors])
     return vid
+
+
+# ---------------- 起讫站客流核算 ----------------
+
+def effective_od_tables(conn: sqlite3.Connection, version_id: int,
+                        service_date: str, trip_id: str) -> dict:
+    """单条 SELECT（同一快照）读取当前生效的两份底表。
+
+    返回 {"stop_totals": {...} | None, "verified_od": {...} | None}。
+    指针与内容在同一条查询里读出，因此永远是同一时点生效的组合。
+    """
+    rows = conn.execute(
+        "SELECT e.kind, t.id, t.csv_content, t.created_at "
+        "FROM od_effective e JOIN od_tables t ON t.id = e.table_id "
+        "WHERE e.version_id = ? AND e.service_date = ? AND e.trip_id = ?",
+        (version_id, service_date, trip_id)).fetchall()
+    out = {"stop_totals": None, "verified_od": None}
+    for r in rows:
+        out[r["kind"]] = {"id": r["id"], "csv_content": r["csv_content"],
+                          "created_at": r["created_at"]}
+    return out
+
+
+def swap_od_table(conn: sqlite3.Connection, version_id: int, service_date: str,
+                  trip_id: str, kind: str, csv_content: str, check) -> int:
+    """原子换交一份底表，返回新表 id。
+
+    BEGIN IMMEDIATE 串行化所有换交：交错提交在事务内重新读取
+    “实际生效的组合”并交给 check(current) 核验；check 抛异常
+    （如 odflow.OdRejected）或写库失败都会整体回滚，
+    原表和原结果继续可查。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        current = effective_od_tables(conn, version_id, service_date, trip_id)
+        check(current)  # 核验新表与当前生效组合的全趟分配可行性
+        cur = conn.execute(
+            "INSERT INTO od_tables (version_id, service_date, trip_id, kind, "
+            "status, csv_content) VALUES (?, ?, ?, ?, 'active', ?)",
+            (version_id, service_date, trip_id, kind, csv_content))
+        table_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO od_effective (version_id, service_date, trip_id, kind, "
+            "table_id) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(version_id, service_date, trip_id, kind) "
+            "DO UPDATE SET table_id = excluded.table_id, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            (version_id, service_date, trip_id, kind, table_id))
+        conn.execute("COMMIT")
+        return table_id
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+
+def record_rejected_od(conn: sqlite3.Connection, version_id: int,
+                       service_date: str, trip_id: str, kind: str,
+                       errors: list[dict]) -> None:
+    """记录一次被拒绝的提交（审计用），独立事务，不触碰生效指针。"""
+    with conn:
+        conn.execute(
+            "INSERT INTO od_tables (version_id, service_date, trip_id, kind, "
+            "status, error_count, errors_json) "
+            "VALUES (?, ?, ?, ?, 'rejected', ?, ?)",
+            (version_id, service_date, trip_id, kind, len(errors),
+             json.dumps(errors, ensure_ascii=False)))
+
+
+def list_od_records(conn: sqlite3.Connection, version_id: int,
+                    service_date: str, trip_id: str, limit: int = 10
+                    ) -> list[dict]:
+    """该班次最近的提交记录（含被拒绝的），新的在前。"""
+    rows = conn.execute(
+        "SELECT id, kind, status, error_count, errors_json, created_at "
+        "FROM od_tables WHERE version_id = ? AND service_date = ? "
+        "AND trip_id = ? ORDER BY id DESC LIMIT ?",
+        (version_id, service_date, trip_id, limit)).fetchall()
+    return [dict(r) for r in rows]
